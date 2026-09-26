@@ -1,11 +1,6 @@
-const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-function headers(extra={}) { return { apikey:key, Authorization:'Bearer '+key, 'Content-Type':'application/json', ...extra }; }
-async function db(path, options={}) {
-  if (!url || !key) throw new Error('Server database settings are not configured.');
-  const response = await fetch(url+'/rest/v1/'+path, { ...options, headers:headers(options.headers) });
-  if (!response.ok) throw new Error(await response.text());
-  return response.status === 204 ? null : response.json();
-}
-function send(res,status,value) { res.status(status).json(value); }
-module.exports = { db, send };
+const crypto=require('crypto'),url=process.env.SUPABASE_URL,key=process.env.SUPABASE_SERVICE_ROLE_KEY;
+const headers=(x={})=>({apikey:key,Authorization:'Bearer '+key,'Content-Type':'application/json',...x});
+async function db(path,o={}){if(!url||!key)throw Error('Server database settings are not configured.');const r=await fetch(url+'/rest/v1/'+path,{...o,headers:headers(o.headers)});if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}
+function send(res,status,value){res.status(status).json(value)}
+async function syncSheet(t,splits=[]){const id=process.env.GOOGLE_SHEETS_ID,s=JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON||'{}');if(!id||!s.client_email)throw Error('Google Sheets settings are not configured.');const b=x=>Buffer.from(x).toString('base64url'),n=Math.floor(Date.now()/1000),u=b(JSON.stringify({alg:'RS256',typ:'JWT'}))+'.'+b(JSON.stringify({iss:s.client_email,scope:'https://www.googleapis.com/auth/spreadsheets',aud:'https://oauth2.googleapis.com/token',iat:n,exp:n+3600})),sig=crypto.createSign('RSA-SHA256').update(u).end().sign(s.private_key,'base64url');const auth=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'urn:ietf:params:oauth:grant-type:jwt-bearer',assertion:u+'.'+sig})});if(!auth.ok)throw Error('Google authorization failed.');const h={Authorization:'Bearer '+(await auth.json()).access_token,'Content-Type':'application/json'},tab=t.kind==='sale'?'Sales':'Expenses',meta=await fetch('https://sheets.googleapis.com/v4/spreadsheets/'+id,{headers:h}),tabs=(await meta.json()).sheets.map(x=>x.properties.title);if(!tabs.includes(tab))await fetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+':batchUpdate',{method:'POST',headers:h,body:JSON.stringify({requests:[{addSheet:{properties:{title:tab}}}]})});const row=t.kind==='sale'?[t.reference,t.source,t.customer,t.project,t.description,Number(t.amount),splits.map(x=>x.name+': '+x.proposed_percent+'%').join(', '),t.status]:[t.reference,t.source,t.expense_category,t.proposed_allocation,t.description,Number(t.amount),t.status];const read=await fetch('https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values/'+tab+'!A:Z',{headers:h}),rows=(await read.json()).values||[],i=rows.findIndex(x=>x[0]===t.reference),range=i<0?tab+'!A:Z':tab+'!A'+(i+1),target='https://sheets.googleapis.com/v4/spreadsheets/'+id+'/values/'+range+(i<0?':append?valueInputOption=USER_ENTERED':'?valueInputOption=USER_ENTERED'),out=await fetch(target,{method:i<0?'POST':'PUT',headers:h,body:JSON.stringify({values:[row]})});if(!out.ok)throw Error('Google Sheets write failed.');await db('transactions?id=eq.'+t.id,{method:'PATCH',body:JSON.stringify({sheet_sync_status:'synced'})})}
+module.exports={db,send,syncSheet};

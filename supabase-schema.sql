@@ -20,3 +20,11 @@ create table if not exists commission_splits (
 );
 insert into employees(name,role) values
  ('Svetlana de Monte Carlo','manager'),('Richard Darling','salesperson'),('Anastasia Ferrari','salesperson'),('Jean-Claude Bērziņš','salesperson'),('Kevin von Whatever','expense_reporter') on conflict(name) do nothing;
+-- Compatibility for the early classroom database, where sheet_sync_status
+-- was created with the delivery_status enum instead of text.
+do $$
+begin
+  if exists (select 1 from pg_type where typname = 'delivery_status') then
+    alter type delivery_status add value if not exists 'synced';
+  end if;
+end $$;

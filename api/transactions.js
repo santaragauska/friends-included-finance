@@ -1,51 +1,11 @@
-const { db, send } = require('./_shared');
-const cents = value => Math.round(Number(value) * 100) / 100;
-const requireManager = role => { if (role !== 'manager') throw new Error('Only Svetlana may approve or correct records.'); };
-
-function validate(input) {
-  if (!input.reference || !/^[SE][0-9]+$/.test(input.reference)) throw new Error('Use a reference like S01 or E01.');
-  if (!(Number(input.amount) > 0)) throw new Error('Amount must be greater than zero.');
-  if (input.kind === 'sale') {
-    const sum = ['richard', 'anastasia', 'jeanClaude'].reduce((n, k) => n + Number(input.splits?.[k] || 0), 0);
-    if (Math.round(sum * 100) !== 10000) throw new Error('Commission shares must total exactly 100%.');
-    if (!input.customer || !input.project) throw new Error('Customer and project are required for a sale.');
-  }
-  if (input.kind === 'expense' && (!input.category || !input.proposedAllocation)) throw new Error('Category and proposed allocation are required for an expense.');
-}
-async function employee(name) { const rows = await db(`employees?name=eq.${encodeURIComponent(name)}&select=*`); return rows[0]; }
-async function create(req, res) {
-  const input = req.body; validate(input);
-  const reporter = await employee(input.employee);
-  if (!reporter) throw new Error('Unknown demonstration employee.');
-  if (input.kind === 'sale' && reporter.role !== 'salesperson') throw new Error('Only salespeople can submit sales.');
-  if (input.kind === 'expense' && reporter.role !== 'expense_reporter') throw new Error('Only Kevin can submit expenses.');
-  const overhead = input.kind === 'expense' && input.proposedAllocation === 'company_overhead';
-  const row = { reference: input.reference, kind: input.kind, submitter_id: reporter.id, submitter_role: reporter.role, source: 'website', originating_chat_id: reporter.linked_telegram_chat_id, customer: input.kind === 'sale' ? input.customer : null, project: input.kind === 'sale' ? input.project : null, description: input.description, amount: cents(input.amount), expense_category: input.kind === 'expense' ? input.category : null, proposed_allocation: input.kind === 'expense' ? input.proposedAllocation : null, final_allocation: overhead ? 'company_overhead' : null, status: input.kind === 'sale' ? 'pending_approval' : (overhead ? 'overhead' : 'awaiting_allocation') };
-  const saved = await db('transactions', { method: 'POST', headers: { Prefer: 'return=representation' }, body: JSON.stringify(row) });
-  if (input.kind === 'sale') {
-    const names = { richard: 'Richard Darling', anastasia: 'Anastasia Ferrari', jeanClaude: 'Jean-Claude Bērziņš' };
-    const people = await Promise.all(Object.entries(names).map(async ([key, name]) => ({ employee: await employee(name), pct: Number(input.splits[key]) })));
-    await db('commission_splits', { method: 'POST', body: JSON.stringify(people.map(p => ({ transaction_id: saved[0].id, employee_id: p.employee.id, proposed_percent: p.pct }))) });
-  }
-  send(res, 201, { transaction: saved[0], message: `${input.reference} saved successfully.` });
-}
-async function approve(req, res) {
-  requireManager(req.body.role);
-  const { id, project, splits } = req.body;
-  const rows = await db(`transactions?id=eq.${id}&select=*`); const tx = rows[0]; if (!tx) throw new Error('Transaction not found.');
-  if (tx.status === 'approved' || tx.status === 'overhead') return send(res, 200, { message: 'This record is already final; totals were not changed.' });
-  const manager = await employee('Svetlana de Monte Carlo');
-  if (tx.kind === 'sale') {
-    const final = splits || {}; const pct = Object.values(final).map(Number); if (pct.length !== 3 || Math.round(pct.reduce((a,b) => a+b,0)*100) !== 10000) throw new Error('Final commission shares must total 100%.');
-    const people = await Promise.all(['Richard Darling','Anastasia Ferrari','Jean-Claude Bērziņš'].map(employee));
-    const pool = cents(Number(tx.amount) * .10); let amounts = pct.map(p => cents(pool * p / 100));
-    const delta = cents(pool - amounts.reduce((a,b)=>a+b,0)); const high = Math.max(...pct); const tieOrder = [0,1,2]; amounts[tieOrder.find(i => pct[i] === high)] = cents(amounts[tieOrder.find(i => pct[i] === high)] + delta);
-    for (let i=0;i<3;i++) await db(`commission_splits?transaction_id=eq.${id}&employee_id=eq.${people[i].id}`, { method:'PATCH', body: JSON.stringify({ final_percent:pct[i], earned_amount:amounts[i] }) });
-    await db(`transactions?id=eq.${id}`, { method:'PATCH', body: JSON.stringify({ status:'approved', manager_id:manager.id, manager_decided_at:new Date().toISOString() }) });
-  } else {
-    const final = project; if (!['A','B','company_overhead'].includes(final)) throw new Error('Choose a final allocation.');
-    await db(`transactions?id=eq.${id}`, { method:'PATCH', body: JSON.stringify({ final_allocation:final, status:'approved', manager_id:manager.id, manager_decided_at:new Date().toISOString() }) });
-  }
-  send(res, 200, { message: `${tx.reference} approved.` });
-}
-module.exports = async (req, res) => { try { if (req.method === 'POST') return await create(req,res); if (req.method === 'PATCH') return await approve(req,res); return send(res,405,{error:'Method not allowed'}); } catch (error) { send(res,400,{error:error.message}); } };
+const { PEOPLE, db, send, cents, money, requireManager, validSplit, calculateCommissions, attemptSheetSync, notify } = require('./_shared');
+async function employee(name) { return (await db(`employees?name=eq.${encodeURIComponent(name)}&select=*`))[0]; }
+async function people() { const all=await db('employees?select=id,name'); return PEOPLE.map(name=>all.find(p=>p.name===name)); }
+async function get(id) { return (await db(`transactions?id=eq.${id}&select=*`))[0]; }
+async function splitsFor(t) { if(t.kind!=='sale') return []; const [splits,staff]=await Promise.all([db(`commission_splits?transaction_id=eq.${t.id}&select=*`),people()]); return splits.map(s=>({...s,name:staff.find(x=>x.id===s.employee_id)?.name})); }
+function validate(i) { if(!i.reference||!/^[SE][0-9]+$/i.test(i.reference)) throw new Error('Use a reference like S01 or E01.'); if(!['sale','expense'].includes(i.kind)||!i.description?.trim()) throw new Error('Type and description are required.'); if(!(Number(i.amount)>0)) throw new Error('Amount must be greater than zero.'); if(i.kind==='sale'){if(!i.customer?.trim()||!['A','B'].includes(i.project))throw new Error('Customer and project are required for a sale.');validSplit(i.splits)} if(i.kind==='expense'&&(!['Materials','Travel','Other'].includes(i.category)||!['A','B','company_overhead'].includes(i.proposedAllocation))) throw new Error('Choose an expense category and allocation.'); }
+async function create(i,source='website',chatId=null) { validate(i); i.reference=i.reference.toUpperCase(); const reporter=await employee(i.employee); if(!reporter)throw new Error('Unknown demonstration employee.'); if(i.kind==='sale'&&reporter.role!=='salesperson')throw new Error('Only salespeople can submit sales.'); if(i.kind==='expense'&&reporter.role!=='expense_reporter')throw new Error('Only Kevin can submit expenses.'); if((await db(`transactions?reference=eq.${encodeURIComponent(i.reference)}&select=id`)).length)throw new Error(`${i.reference} already exists; duplicate references are refused.`); const overhead=i.kind==='expense'&&i.proposedAllocation==='company_overhead'; const row={reference:i.reference,kind:i.kind,submitter_id:reporter.id,submitter_name:reporter.name,submitter_role:reporter.role,source,originating_chat_id:chatId||reporter.linked_telegram_chat_id||null,customer:i.kind==='sale'?i.customer.trim():null,project:i.kind==='sale'?i.project:null,description:i.description.trim(),amount:cents(i.amount),expense_category:i.kind==='expense'?i.category:null,proposed_allocation:i.kind==='expense'?i.proposedAllocation:null,final_allocation:overhead?'company_overhead':null,status:i.kind==='sale'?'pending_approval':overhead?'overhead':'awaiting_allocation',sheet_sync_status:'pending',notification_status:'not_applicable'}; const saved=(await db('transactions',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify(row)}))[0]; if(i.kind==='sale'){const staff=await people(),pcts=validSplit(i.splits);await db('commission_splits',{method:'POST',body:JSON.stringify(staff.map((p,n)=>({transaction_id:saved.id,employee_id:p.id,proposed_percent:pcts[n]})))});} const splits=await splitsFor(saved),sync=await attemptSheetSync(saved,splits); return {transaction:saved,sync}; }
+async function approve(b) { const manager=await requireManager(b.actorEmployeeId); const t=await get(b.id); if(!t)throw new Error('Transaction not found.');if(['approved','overhead'].includes(t.status))return {message:'This record is already final; totals were not changed.'};let text;if(t.kind==='sale'){const pct=validSplit(b.splits),rows=await splitsFor(t),old=rows.map(s=>Number(s.proposed_percent)),commission=calculateCommissions(t.amount,pct);for(let n=0;n<3;n++){const split=rows.find(s=>s.name===PEOPLE[n]);await db(`commission_splits?transaction_id=eq.${t.id}&employee_id=eq.${split.employee_id}`,{method:'PATCH',body:JSON.stringify({final_percent:pct[n],earned_amount:commission.amounts[n]})});}await db(`transactions?id=eq.${t.id}`,{method:'PATCH',body:JSON.stringify({status:'approved',manager_id:manager.id,manager_decided_at:new Date().toISOString(),notification_status:'pending'})});const changed=old.some((v,n)=>v!==pct[n]);text=`${t.reference} approved${changed?' — commission split changed':''}. Sale ${money(t.amount)}; total commission ${money(commission.pool)}. ${PEOPLE.map((name,n)=>`${name.split(' ')[0]}: ${old[n]}% → ${pct[n]}% (${money(commission.amounts[n])})`).join('; ')}.`;}else{if(!['A','B','company_overhead'].includes(b.project))throw new Error('Choose a final allocation.');const changed=t.proposed_allocation!==b.project;await db(`transactions?id=eq.${t.id}`,{method:'PATCH',body:JSON.stringify({final_allocation:b.project,status:'approved',manager_id:manager.id,manager_decided_at:new Date().toISOString(),notification_status:'pending'})});text=`${t.reference}${changed?' — allocation changed':' allocation confirmed'}. ${money(t.amount)}: ${t.description}. Proposed: ${t.proposed_allocation}; approved: ${b.project}.`;}
+ const updated=await get(t.id),splits=await splitsFor(updated),sync=await attemptSheetSync(updated,splits),delivery=await notify(updated,text);return {message:`${t.reference} approved.${sync.status==='failed'?' Sheet sync failed; retry is available.':''}${delivery.status==='failed'?' Telegram delivery failed; retry is available.':''}`,sync,delivery}; }
+module.exports=async(req,res)=>{try{if(req.method==='POST'){const r=await create(req.body);return send(res,201,{...r,message:`${r.transaction.reference} saved successfully.${r.sync.status==='failed'?' Google Sheets sync is pending.':''}`});}if(req.method==='PATCH')return send(res,200,await approve(req.body));return send(res,405,{error:'Method not allowed'});}catch(error){return send(res,400,{error:error.message});}};
+module.exports.createFromBot=create;module.exports.splitsFor=splitsFor;

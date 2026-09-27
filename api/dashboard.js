@@ -11,6 +11,9 @@ module.exports = async (req, res) => {
     const approved = transactions.filter(t => t.status === 'approved');
     const projects = { A: { income: 0, commissions: 0, expenses: 0 }, B: { income: 0, commissions: 0, expenses: 0 } };
     let overhead = 0, awaiting = 0;
+    for (const t of transactions) {
+      if (t.kind === 'expense' && t.status === 'overhead') overhead += Number(t.amount);
+    }
     for (const t of approved) {
       if (t.kind === 'sale') projects[t.project].income += Number(t.amount);
       if (t.kind === 'expense') {
@@ -26,6 +29,7 @@ module.exports = async (req, res) => {
     const commissionByEmployee = Object.fromEntries(employees.filter(e => e.role === 'salesperson').map(e => [e.id, 0]));
     splits.filter(s => s.final_percent != null).forEach(s => { commissionByEmployee[s.employee_id] = (commissionByEmployee[s.employee_id] || 0) + Number(s.earned_amount); });
     const result = p => p.income - p.commissions - p.expenses;
-    send(res, 200, { transactions, employees, splits, metrics: { projects: { A: { ...projects.A, result: result(projects.A) }, B: { ...projects.B, result: result(projects.B) } }, overhead, awaiting, companyResult: result(projects.A) + result(projects.B) - overhead - awaiting, commissions: Object.entries(commissionByEmployee).map(([id, amount]) => ({ name: byId[id]?.name, amount })) } });
+    const visibleSplits = splits.map(s => ({ ...s, employee_name: byId[s.employee_id]?.name }));
+    send(res, 200, { transactions, employees, splits: visibleSplits, metrics: { projects: { A: { ...projects.A, result: result(projects.A) }, B: { ...projects.B, result: result(projects.B) } }, overhead, awaiting, companyResult: result(projects.A) + result(projects.B) - overhead - awaiting, commissions: Object.entries(commissionByEmployee).map(([id, amount]) => ({ name: byId[id]?.name, amount })) } });
   } catch (error) { send(res, 500, { error: error.message }); }
 };

@@ -8,6 +8,18 @@ async function splitsFor(t) {
   const [splits, staff] = await Promise.all([db(`commission_splits?transaction_id=eq.${t.id}&select=*`), people()]);
   return splits.map(s => ({ ...s, name: staff.find(x => x.id === s.employee_id)?.name }));
 }
+function decisionMessage(t, rows) {
+  if (t.kind === 'sale') {
+    const ordered = PEOPLE.map(name => rows.find(s => s.name === name));
+    const proposed = ordered.map(s => Number(s.proposed_percent));
+    const final = ordered.map(s => Number(s.final_percent));
+    const pool = ordered.reduce((sum, s) => sum + Number(s.earned_amount || 0), 0);
+    const changed = proposed.some((value, index) => value !== final[index]);
+    return `${t.reference} approved${changed ? ' — commission split changed' : ''}. Sale ${money(t.amount)}; total commission ${money(pool)}. ${PEOPLE.map((name, index) => `${name.split(' ')[0]}: ${proposed[index]}% → ${final[index]}% (${money(ordered[index].earned_amount)})`).join('; ')}.`;
+  }
+  const changed = t.proposed_allocation !== t.final_allocation;
+  return `${t.reference}${changed ? ' — allocation changed' : ' allocation confirmed'}. ${money(t.amount)}: ${t.description}. Proposed: ${t.proposed_allocation}; approved: ${t.final_allocation}.`;
+}
 function validate(i) {
   if (!i.reference || !/^[SE][0-9]+$/i.test(i.reference)) throw new Error('Use a reference like S01 or E01.');
   if (!['sale', 'expense'].includes(i.kind) || !i.description?.trim()) throw new Error('Type and description are required.');
@@ -46,23 +58,18 @@ async function approve(body) {
   const t = await get(body.id);
   if (!t) throw new Error('Transaction not found.');
   if (['approved', 'overhead'].includes(t.status)) return { message: 'This record is already final; totals were not changed.' };
-  let text;
   if (t.kind === 'sale') {
-    const percentages = validSplit(body.splits), rows = await splitsFor(t), old = rows.map(s => Number(s.proposed_percent)), commission = calculateCommissions(t.amount, percentages);
+    const percentages = validSplit(body.splits), rows = await splitsFor(t), commission = calculateCommissions(t.amount, percentages);
     for (let n = 0; n < 3; n++) {
       const split = rows.find(s => s.name === PEOPLE[n]);
       await db(`commission_splits?transaction_id=eq.${t.id}&employee_id=eq.${split.employee_id}`, { method: 'PATCH', body: JSON.stringify({ final_percent: percentages[n], earned_amount: commission.amounts[n] }) });
     }
     await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'approved', manager_id: manager.id, manager_decided_at: new Date().toISOString(), notification_status: 'pending' }) });
-    const changed = old.some((v, n) => v !== percentages[n]);
-    text = `${t.reference} approved${changed ? ' — commission split changed' : ''}. Sale ${money(t.amount)}; total commission ${money(commission.pool)}. ${PEOPLE.map((name, n) => `${name.split(' ')[0]}: ${old[n]}% → ${percentages[n]}% (${money(commission.amounts[n])})`).join('; ')}.`;
   } else {
     if (!['A', 'B', 'company_overhead'].includes(body.project)) throw new Error('Choose a final allocation.');
-    const changed = t.proposed_allocation !== body.project;
     await db(`transactions?id=eq.${t.id}`, { method: 'PATCH', body: JSON.stringify({ final_allocation: body.project, status: 'approved', manager_id: manager.id, manager_decided_at: new Date().toISOString(), notification_status: 'pending' }) });
-    text = `${t.reference}${changed ? ' — allocation changed' : ' allocation confirmed'}. ${money(t.amount)}: ${t.description}. Proposed: ${t.proposed_allocation}; approved: ${body.project}.`;
   }
-  const updated = await get(t.id), splits = await splitsFor(updated), sync = await attemptSheetSync(updated, splits), delivery = await notify(updated, text);
+  const updated = await get(t.id), splits = await splitsFor(updated), sync = await attemptSheetSync(updated, splits), delivery = await notify(updated, decisionMessage(updated, splits));
   return { message: `${t.reference} approved.${sync.status === 'failed' ? ' Sheet sync failed; retry is available.' : ''}${delivery.status === 'failed' ? ' Telegram delivery failed; retry is available.' : ''}`, sync, delivery };
 }
 
@@ -79,3 +86,4 @@ module.exports = async (req, res) => {
 };
 module.exports.createFromBot = create;
 module.exports.splitsFor = splitsFor;
+module.exports.decisionMessage = decisionMessage;

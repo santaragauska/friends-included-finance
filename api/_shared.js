@@ -7,7 +7,15 @@ const money = value => `€${cents(value).toFixed(2)}`;
 const configured = () => Boolean(url && key);
 const send = (res, status, value) => res.status(status).json(value);
 const headers = extra => ({ apikey: key, Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...(extra || {}) });
-async function db(path, options = {}) { if (!configured()) throw new Error('Server database settings are not configured yet.'); const response = await fetch(`${url}/rest/v1/${path}`, { ...options, headers: headers(options.headers) }); if (!response.ok) throw new Error(await response.text()); return response.status === 204 ? null : response.json(); }
+async function db(path, options = {}) {
+  if (!configured()) throw new Error('Server database settings are not configured yet.');
+  const response = await fetch(`${url}/rest/v1/${path}`, { ...options, headers: headers(options.headers) });
+  const body = await response.text();
+  if (!response.ok) throw new Error(body || `Database request failed (${response.status}).`);
+  // Supabase may successfully return 201/200 with an empty body. Parsing that as
+  // JSON was the source of the misleading “Unexpected end of JSON input” reply.
+  return body ? JSON.parse(body) : null;
+}
 async function requireManager(actorEmployeeId) {
   if (!actorEmployeeId) throw new Error('Select the manager role before approving or changing a Telegram link.');
   const person = (await db(`employees?id=eq.${encodeURIComponent(actorEmployeeId)}&select=id,name,role`))[0];
